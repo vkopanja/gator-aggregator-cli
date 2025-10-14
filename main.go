@@ -40,10 +40,21 @@ func main() {
 	currentState := &state{config: config, db: dbQueries}
 
 	commands := commands{commands: make(map[string]func(*state, command) error)}
+	commands.register("help", func(s *state, _ command) error {
+		fmt.Println("Available commands:")
+		for cmd := range commands.commands {
+			fmt.Printf("  %s\n", cmd)
+		}
+		return nil
+	})
 	commands.register("login", handlerLogin)
 	commands.register("register", handlerRegister)
 	commands.register("reset", handlerReset)
 	commands.register("users", handlerGetUsers)
+	commands.register("addfeed", middlewareLoggedIn(handlerAddFeed))
+	commands.register("feeds", handlerFetchFeeds)
+	commands.register("follow", middlewareLoggedIn(handlerFollowFeed))
+	commands.register("following", middlewareLoggedIn(handlerFeedFollowsForUser))
 
 	args := os.Args
 	if len(args) < 2 {
@@ -127,6 +138,108 @@ func handlerGetUsers(s *state, _ command) error {
 		}
 	}
 	return nil
+}
+
+func handlerAddFeed(s *state, cmd command, currentUser database.User) error {
+	if len(cmd.args) < 2 {
+		return fmt.Errorf("the addfeed handler expects a two params, name and url")
+	}
+
+	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
+		ID:        uuid.New(),
+		UserID:    currentUser.ID,
+		Name:      cmd.args[0],
+		Url:       cmd.args[1],
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed creating feed: %s\n", err)
+	}
+
+	_, err = s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		FeedID:    feed.ID,
+		UserID:    currentUser.ID,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed creating feed follow: %s\n", err)
+	}
+
+	fmt.Printf("Name: %s\n", feed.Name)
+	fmt.Printf("URL: %s\n", feed.Url)
+	fmt.Printf("User ID: %s\n", feed.UserID)
+
+	return nil
+}
+
+func handlerFetchFeeds(s *state, _ command) error {
+	feeds, err := s.db.GetFeedsWithUserName(context.Background())
+	if err != nil {
+		return err
+	}
+
+	for _, feed := range feeds {
+		fmt.Printf("Name: %s\n", feed.Name)
+		fmt.Printf("URL: %s\n", feed.Url)
+		fmt.Printf("User: %s\n", feed.UserName)
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func handlerFollowFeed(s *state, cmd command, currentUser database.User) error {
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("the follow handler expects a single argument, the feed url")
+	}
+
+	feed, err := s.db.GetFeedByUrl(context.Background(), cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("feed with the requested url does not exist")
+	}
+
+	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		FeedID:    feed.ID,
+		UserID:    currentUser.ID,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed creating feed follow: %s\n", err)
+	}
+
+	fmt.Printf("Feed: %s\n", follow.FeedName)
+	fmt.Printf("User: %s\n", follow.UserName)
+
+	return nil
+}
+
+func handlerFeedFollowsForUser(s *state, _ command, currentUser database.User) error {
+	feeds, err := s.db.GetFeedsForUser(context.Background(), currentUser.Name)
+	if err != nil {
+		return fmt.Errorf("failed getting feeds for user: %s\n", err)
+	}
+
+	for _, feed := range feeds {
+		fmt.Printf("- '%s'\n", feed.Name)
+	}
+
+	return nil
+}
+
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
+	return func(s *state, cmd command) error {
+		user, err := s.db.GetUser(context.Background(), s.config.CurrentUserName)
+		if err != nil {
+			return fmt.Errorf("failed to get current user: %w", err)
+		}
+
+		return handler(s, cmd, user)
+	}
 }
 
 func (c *commands) run(s *state, cmd command) error {
