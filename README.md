@@ -1,4 +1,4 @@
-# Gator, blog aggregator - boot.dev
+# Gator, RSS feed aggregator - boot.dev
 
 A RSS aggregator written in Go during the guided course on [boot.dev](https://boot.dev).
 
