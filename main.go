@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	cfg "gator/internal/config"
 	"gator/internal/database"
+	"gator/internal/rss"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -55,6 +59,9 @@ func main() {
 	commands.register("feeds", handlerFetchFeeds)
 	commands.register("follow", middlewareLoggedIn(handlerFollowFeed))
 	commands.register("following", middlewareLoggedIn(handlerFeedFollowsForUser))
+	commands.register("unfollow", middlewareLoggedIn(handlerUnfollowFeed))
+	commands.register("agg", handlerAgg)
+	commands.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	args := os.Args
 	if len(args) < 2 {
@@ -226,6 +233,125 @@ func handlerFeedFollowsForUser(s *state, _ command, currentUser database.User) e
 
 	for _, feed := range feeds {
 		fmt.Printf("- '%s'\n", feed.Name)
+	}
+
+	return nil
+}
+
+func handlerUnfollowFeed(s *state, cmd command, currentUser database.User) error {
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("the unfollow handler expects a single argument, the feed url")
+	}
+
+	feed, err := s.db.GetFeedByUrl(context.Background(), cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("feed with the requested url does not exist")
+	}
+
+	_, err = s.db.UnfollowFeed(context.Background(), database.UnfollowFeedParams{
+		UserID: currentUser.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed deleting feed follow: %s\n", err)
+	}
+
+	return nil
+}
+
+func handlerAgg(s *state, cmd command) error {
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("the agg handler expects a single argument, the time interval how oftern to fetch feeds")
+	}
+
+	duration, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("failed parsing duration: %s", err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", duration.String()+"")
+
+	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
+
+	for ; ; <-ticker.C {
+		err := scrapeFeeds(s)
+		if err != nil {
+			fmt.Printf("failed scraping feed: %s\n", err)
+		}
+	}
+}
+
+func handlerBrowse(s *state, cmd command, currentUser database.User) error {
+	var limit int
+	if len(cmd.args) < 1 {
+		limit = 2
+	} else {
+		parsedInt, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			limit = 2
+		} else {
+			limit = parsedInt
+		}
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: currentUser.ID,
+		Limit:  int32(limit),
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, post := range posts {
+		fmt.Printf("Title: %s\n", post.Title)
+	}
+
+	return nil
+}
+
+func scrapeFeeds(s *state) error {
+	nextFeed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed getting next feed to fetch: %s", err)
+	}
+
+	fmt.Printf("Fetching items for feed: %s\n", nextFeed.Name)
+
+	_, err = s.db.MarkFeedFetched(context.Background(), nextFeed.ID)
+	if err != nil {
+		return err
+	}
+
+	feed, err := rss.FetchFeed(context.Background(), nextFeed.Url)
+	if err != nil {
+		return fmt.Errorf("failed fetching feed: %s", err)
+	}
+
+	for _, item := range feed.Channel.Item {
+		parsedTime, err := time.Parse(time.RFC1123Z, item.PubDate)
+		validTime := err == nil
+		if err != nil {
+			fmt.Printf("failed parsing time for post %s: %s\n", item.Title, err)
+		}
+		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			Title:       item.Title,
+			Url:         sql.NullString{String: item.Link, Valid: item.Link != ""},
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: sql.NullTime{Time: parsedTime, Valid: validTime},
+			FeedID:      nextFeed.ID,
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+		})
+		if err != nil {
+			var pqError *pq.Error
+			if errors.As(err, &pqError) && pqError.Code == "23505" {
+				// duplicate key for URL, we can either ignore it, updated it or just log it
+				// for now we'll ignore
+				continue
+			}
+			fmt.Printf("failed creating post with title %s: %s\n", item.Title, err)
+		}
 	}
 
 	return nil
